@@ -353,3 +353,28 @@ const finalResult = runQuery(sqlQuery, data.friends);
 console.log(formatAsMySQLTable(finalResult));
 
 
+let sqlQuery = `select 
+    lpad(name, 10, '.') AS padded_name,
+    rpad(age, 5, '*') AS padded_age,
+    ltrim('   hello') AS clean_left
+from data.$friends 
+where 1=1 limit 3,1`;
+
+sqlQuery = `SELECT name, age FROM data.$friends ORDER BY age DESC`
+sqlQuery =`SELECT city, COUNT(*) FROM data.$friends GROUP BY city ORDER BY COUNT(*) DESC;`
+const sqlQuery = `SELECT city, COUNT(*) FROM data.$friends GROUP BY city HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC;`;
+const sqlQuery = `SELECT name, age, COUNT(*), ROW_NUMBER() OVER() as rank 
+FROM data.$friends 
+GROUP BY name, age 
+ORDER BY name DESC;`;
+
+const sqlQuery = `SELECT name, age, ROW_NUMBER() OVER(ORDER BY name,age) as age_rank 
+FROM data.friends 
+GROUP BY name, age 
+ORDER BY name ASC;`;
+
+const sqlQuery = `SELECT city, name, age, 
+       ROW_NUMBER() OVER(PARTITION BY city ORDER BY age ASC) as city_rank 
+FROM data.friends 
+GROUP BY city, name, age 
+ORDER BY city ASC, city_rank ASC;`;
