@@ -378,3 +378,106 @@ const sqlQuery = `SELECT city, name, age,
 FROM data.friends 
 GROUP BY city, name, age 
 ORDER BY city ASC, city_rank ASC;`;
+
+const sqlQuery = `SELECT city, gender, name, age,
+       ROW_NUMBER() OVER (
+            PARTITION BY city, gender
+            ORDER BY name ASC
+        ) AS city_rank
+FROM data.friends
+GROUP BY city, gender, name, age
+ORDER BY  city, gender, city_rank`;
+
+const sqlQuery = `
+    SELECT name, age,
+           ROW_NUMBER() OVER (ORDER BY age ASC) as rn,
+           RANK()       OVER (ORDER BY age ASC) as rk,
+           DENSE_RANK() OVER (ORDER BY age ASC) as dr
+    FROM data.friends
+    ORDER BY age ASC
+`;
+const statsQuery = `
+    SELECT city, 
+           COUNT() as count, 
+           AVG(age) as average_age,
+           MAX(age) as oldest
+    FROM data.friends
+    GROUP BY city
+    ORDER BY average_age DESC
+`;
+const statsQuery=`SELECT name, age, 
+       RANK() OVER (ORDER BY age DESC) as age_rank
+FROM data.friends
+WHERE age > 20
+ORDER BY age_rank ASC`;
+const complexQuery = `
+    SELECT city, COUNT() as female_count, AVG(age) as avg_age
+    FROM data.friends
+    WHERE gender = 'Female' AND age < 30
+    GROUP BY city
+`;
+
+const data = {
+    friends: [
+        { name: "Chris", age: 23, city: "New York", gender: "Male" },
+        { name: "Emily", age: 19, city: "Atlanta", gender: "Female" },
+        { name: "Joe", age: 32, city: "New York", gender: "Male" },
+        { name: "Kevin", age: 19, city: "Atlanta", gender: "Male" },
+        { name: "Michelle", age: 27, city: "Los Angeles", gender: "Female" },
+        { name: "Robert", age: 45, city: "Manhattan", gender: "Male" },
+        { name: "Sarah", age: 31, city: "New York", gender: "Female" }
+    ],
+    cities: [
+        { name: "New York", state: "NY", timezone: "EST" },
+        { name: "Atlanta", state: "GA", timezone: "EST" },
+        { name: "Los Angeles", state: "CA", timezone: "PST" }
+    ]
+};
+const joinQuery = `
+    SELECT name, state
+    FROM data.friends 
+    JOIN data.cities ON city = cityName
+`;
+const data = {
+    friends: [
+        { name: "Chris", age: 23, city: "New York" },
+        { name: "Emily", age: 19, city: "Atlanta" }
+    ],
+    cities: [
+        { cityName: "New York", state: "NY" },
+        { cityName: "Atlanta", state: "GA" }
+    ]
+};
+const joinQuery = `SELECT friends.name, cities.cityName, cities.state
+FROM data.friends 
+JOIN data.cities ON city = cityName
+LIMIT 1`
+
+const leftJoinQuery = `
+    SELECT friends.name, friends.city, cities.state
+    FROM data.friends 
+    LEFT JOIN data.cities ON city = cityName
+
+
+    const data = {
+    friends: [
+        { name: "Chris", city: "New York" },
+        { name: "Lost Traveler", city: "Atlantis" } // Atlantis is not in cities!
+    ],
+    cities: [
+        { cityName: "New York", state: "NY" }
+    ]
+};
+const data = {
+    friends: [
+        { name: "Chris", city: "New York" },
+        { name: "Lost Traveler", city: "Atlantis" } // Atlantis is not in cities!
+    ],
+    cities: [
+        { cityName: "New York", state: "NY" }
+    ]
+};
+    const leftJoinQuery = `SELECT employees.name, levels.rankName
+    FROM data.employees
+    JOIN data.levels ON salary > minSalary
+    ORDER BY salary DESC`;

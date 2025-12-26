@@ -80,73 +80,137 @@ function findTopLevelClause(sqlLower, keyword) {
     return -1;
 }
 
+/**
+ * Helper to find keywords only when they are not nested inside parentheses.
+ * This prevents splitting on keywords inside functions like COALESCE() or RANK().
+ */
+function findTopLevelClause(sql, clause) {
+    const tokens = sql.split(/\s+/);
+    let depth = 0;
+    let index = 0;
+    const lowerSql = sql.toLowerCase();
+    const search = clause.toLowerCase();
+
+    for (let i = 0; i < sql.length; i++) {
+        if (sql[i] === '(') depth++;
+        if (sql[i] === ')') depth--;
+        if (depth === 0 && lowerSql.startsWith(search, i)) {
+            // Check boundaries to ensure it's a whole word
+            const before = i === 0 || /\s/.test(sql[i - 1]);
+            const after = /\s/.test(sql[i + search.length]) || i + search.length === sql.length;
+            if (before && after) return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Main Parser Function
+ */
 function parseSQL(sql) {
-    sql = sql.trim().replace(/;$/, '');
+    // Basic cleanup
+    sql = sql.trim().replace(/;$/, '').replace(/\s+/g, ' ');
     const lower = sql.toLowerCase();
 
+    // 1. Locate main clauses
     const sIdx = findTopLevelClause(lower, "select");
     const fIdx = findTopLevelClause(lower, "from");
     const wIdx = findTopLevelClause(lower, "where");
     const gIdx = findTopLevelClause(lower, "group by");
     const oIdx = findTopLevelClause(lower, "order by");
-    const lIdx = findTopLevelClause(lower, "limit");    // Inside parseSQL
+    const lIdx = findTopLevelClause(lower, "limit");
 
-    const selectPartRaw = sql.slice(sIdx + 6, fIdx).trim();
-    const isDistinct = selectPartRaw.toLowerCase().startsWith("distinct");
+    if (sIdx === -1 || fIdx === -1) {
+        throw new Error("Invalid SQL: Must contain SELECT and FROM clauses.");
+    }
 
-    // Helper to find where a clause ends by looking for the next keyword
-    // Update getEnd to include lIdx
+    // 2. Determine boundaries for extracting strings
     const getEnd = (start) => {
-        const boundaries = [fIdx, wIdx, gIdx, oIdx, lIdx].filter(i => i > start);
+        const boundaries = [wIdx, gIdx, oIdx, lIdx].filter(i => i > start);
         return boundaries.length > 0 ? Math.min(...boundaries) : sql.length;
     };
 
-    // Clean "distinct" out of the string before tokenizing columns
-    const selectPart = isDistinct
-        ? selectPartRaw.slice(8).trim()
-        : selectPartRaw;
+    // 3. Parse SELECT (Handle DISTINCT and Tokens)
+    let selectPartRaw = sql.slice(sIdx + 6, fIdx).trim();
+    const isDistinct = selectPartRaw.toLowerCase().startsWith("distinct");
+    if (isDistinct) selectPartRaw = selectPartRaw.slice(8).trim();
 
-    // 1. Parse individual SELECT columns
-    const selectTokens = getSelectTokensFromPart(selectPart).map(token => {
-        // Window Function Detection
-        const windowMatch = token.expr.match(/(row_number|rank|dense_rank)\s*\(\s*\)\s+over\s*\(([\s\S]*)\)/i);
-        let internalOrder = null, partitionBy = null, funcType = null;
+    // Split select tokens by comma, ignoring commas inside parentheses
+    const selectTokens = [];
+    let depth = 0, current = "";
+    for (let i = 0; i < selectPartRaw.length; i++) {
+        const char = selectPartRaw[i];
+        if (char === '(') depth++;
+        if (char === ')') depth--;
+        if (char === ',' && depth === 0) {
+            selectTokens.push(parseToken(current.trim()));
+            current = "";
+        } else current += char;
+    }
+    selectTokens.push(parseToken(current.trim()));
 
-        if (windowMatch) {
-            funcType = windowMatch[1].toLowerCase();
-            const content = windowMatch[2].trim();
-            const pMatch = content.match(/partition\s+by\s+([\s\S]*?)(?=order\s+by|$)/i);
-            if (pMatch) partitionBy = pMatch[1].trim();
-            const oMatch = content.match(/order\s+by\s+([\s\S]*)/i);
-            if (oMatch) internalOrder = oMatch[1].trim();
-        }
+    // 4. Parse FROM & JOINS (The Chain Logic)
+    const fromSection = sql.slice(fIdx + 4, getEnd(fIdx)).trim();
+    const joinParts = fromSection.split(/\sjoin\s/i);
+    const baseTable = joinParts[0].trim();
+    const joins = [];
 
-        // Aggregate Function Detection
-        const aggMatch = token.expr.match(/(sum|count|avg|min|max)\((.*)\)/i);
+    for (let i = 1; i < joinParts.length; i++) {
+        const joinSegment = joinParts[i]; 
+        // Detect if the previous part ended with "LEFT"
+        const isLeft = joinParts[i-1].toLowerCase().trim().endsWith("left");
+        
+        const onIdx = joinSegment.toLowerCase().indexOf(" on ");
+        if (onIdx === -1) throw new Error("JOIN missing ON condition");
+        
+        const tablePath = joinSegment.slice(0, onIdx).trim();
+        const condition = joinSegment.slice(onIdx + 4).trim();
+        
+        joins.push({ tablePath, condition, isLeft });
+    }
 
-        // RETURN ONLY column-specific data here
-        return {
-            ...token,
-            isWindow: !!windowMatch,
-            windowType: funcType,
-            windowOrder: internalOrder,
-            partitionBy: partitionBy,
-            isAggregate: !!aggMatch,
-            aggFunc: aggMatch ? aggMatch[1].toLowerCase() : null,
-            aggColumn: aggMatch ? aggMatch[2].trim() : null
-        };
-    });
-
-    // 2. Return the full query structure
+    // 5. Final Return Object
     return {
         selectTokens,
-        fromClause: sql.slice(fIdx + 4, getEnd(fIdx)).trim(),
+        isDistinct,
+        baseTable,
+        joins,
         whereClause: wIdx !== -1 ? sql.slice(wIdx + 6, getEnd(wIdx)).trim() : null,
         groupBy: gIdx !== -1 ? sql.slice(gIdx + 8, getEnd(gIdx)).trim() : null,
-        orderClause: oIdx !== -1 ? sql.slice(oIdx + 9).trim() : null,
-        limit: lIdx !== -1 ? parseInt(sql.slice(lIdx + 5).trim()) : null,
-        isDistinct: isDistinct
+        orderClause: oIdx !== -1 ? sql.slice(oIdx + 9, getEnd(oIdx)).trim() : null,
+        limit: lIdx !== -1 ? parseInt(sql.slice(lIdx + 5).trim()) : null
     };
+}
+
+/**
+ * Helper to identify if a SELECT token is an aggregate, window, or scalar
+ */
+function parseToken(raw) {
+    const aliasMatch = raw.match(/(.+) as (.+)/i);
+    const expr = aliasMatch ? aliasMatch[1].trim() : raw;
+    const alias = aliasMatch ? aliasMatch[2].trim() : expr.split('.').pop();
+
+    const isAggregate = /^(sum|avg|count|min|max)\(/i.test(expr);
+    const isWindow = /over\s*\(/i.test(expr);
+
+    let windowType = null, partitionBy = null, windowOrder = null;
+    if (isWindow) {
+        windowType = expr.match(/^(\w+)/i)[0].toLowerCase();
+        const overMatch = expr.match(/over\s*\((.*)\)/i)[1];
+        const partMatch = overMatch.match(/partition by\s+([^order]+)/i);
+        const orderMatch = overMatch.match(/order by\s+(.*)/i);
+        partitionBy = partMatch ? partMatch[1].trim() : null;
+        windowOrder = orderMatch ? orderMatch[1].trim() : null;
+    }
+
+    let aggFunc = null, aggColumn = null;
+    if (isAggregate) {
+        const match = expr.match(/^(\w+)\((.*)\)/i);
+        aggFunc = match[1].toLowerCase();
+        aggColumn = match[2].trim() === "*" ? null : match[2].trim();
+    }
+
+    return { expr, alias, isAggregate, aggFunc, aggColumn, isWindow, windowType, partitionBy, windowOrder };
 }
 
 // --- 4. UPDATED ENGINE CORE ---
@@ -201,64 +265,106 @@ function areRowsTied(rowA, rowB, orderParams) {
 function executeQuery(sql, rootData) {
     const parsed = parseSQL(sql);
 
+    // --- HELPER: COMBINE ROWS & NAMESPACE ---
+    const combineRows = (existingRow, newMatch, nextTableName, rightTemplate = {}) => {
+        const namespacedMatch = {};
+        if (newMatch) {
+            // Map new table columns to nextTable.column
+            Object.keys(newMatch).forEach(k => namespacedMatch[`${nextTableName}.${k}`] = newMatch[k]);
+            return { ...existingRow, ...newMatch, ...namespacedMatch };
+        } else {
+            // Handle NULL-fill for LEFT JOIN
+            const nulls = {};
+            Object.keys(rightTemplate).forEach(k => {
+                nulls[k] = "NULL";
+                namespacedMatch[`${nextTableName}.${k}`] = "NULL";
+            });
+            return { ...existingRow, ...nulls, ...namespacedMatch };
+        }
+    };
 
-    // --- 1. DATA LOADING & JOINING ---
-    const joinMatch = parsed.fromClause.match(/(.+?)\s+(left\s+)?join\s+(.+?)\s+on\s+(.+)/i);
-
+    // --- 1. DATA LOADING & MULTI-JOIN ---
     let rows = [];
-    if (joinMatch) {
-        const leftPath = joinMatch[1].trim();
-        const rightPath = joinMatch[3].trim();
+    const baseData = resolvePath(parsed.baseTable, rootData);
+    if (!baseData) throw new Error(`Table not found: ${parsed.baseTable}`);
 
-        const leftData = resolvePath(leftPath, rootData);
-        const rightData = resolvePath(rightPath, rootData);
+    // Initial Namespacing for the Base Table
+    const baseName = parsed.baseTable.split('.').pop();
+    rows = baseData.map(r => {
+        const namespaced = {};
+        Object.keys(r).forEach(k => namespaced[`${baseName}.${k}`] = r[k]);
+        return { ...r, ...namespaced };
+    });
 
-        // THROW ERRORS IF TABLES DON'T EXIST
-        if (!leftData) throw new Error(`Table does not exist: ${leftPath}`);
-        if (!rightData) throw new Error(`Table does not exist: ${rightPath}`);
+    // Process the Join Chain
+    parsed.joins.forEach(joinDef => {
+        const nextTableData = resolvePath(joinDef.tablePath, rootData);
+        if (!nextTableData) throw new Error(`Table not found: ${joinDef.tablePath}`);
+        
+        const nextTableName = joinDef.tablePath.split('.').pop();
+        const opMatch = joinDef.condition.match(/(=|>|<|>=|<=|!=)/);
+        if (!opMatch) throw new Error("Invalid JOIN condition");
+        
+        const operator = opMatch[0];
+        const [leftCol, rightCol] = joinDef.condition.split(operator).map(c => c.trim());
+        const newRows = [];
 
-        // ... (rest of your existing JOIN logic: leftName, rightName, nested loops) ...
-        const leftName = leftPath.split('.').pop();
-        const rightName = rightPath.split('.').pop();
-        const [leftCol, rightCol] = joinMatch[4].trim().split('=').map(c => c.trim());
+        // STRATEGY: Hash Join (for =) or Nested Loop (for inequalities)
+        if (operator === '=') {
+            const rightMap = new Map();
+            nextTableData.forEach(r => {
+                const key = String(r[rightCol]);
+                if (!rightMap.has(key)) rightMap.set(key, []);
+                rightMap.get(key).push(r);
+            });
 
-        leftData.forEach(leftRow => {
-            let foundMatch = false;
-            rightData.forEach(rightRow => {
-                if (String(leftRow[leftCol]) === String(rightRow[rightCol])) {
-                    foundMatch = true;
-                    const joinedRow = {};
-                    Object.keys(leftRow).forEach(k => joinedRow[`${leftName}.${k}`] = leftRow[k]);
-                    Object.keys(rightRow).forEach(k => joinedRow[`${rightName}.${k}`] = rightRow[k]);
-                    rows.push({ ...leftRow, ...rightRow, ...joinedRow });
+            rows.forEach(existingRow => {
+                const lookupKey = String(existingRow[leftCol] ?? "NULL");
+                const matches = rightMap.get(lookupKey);
+                if (matches) {
+                    matches.forEach(m => newRows.push(combineRows(existingRow, m, nextTableName)));
+                } else if (joinDef.isLeft) {
+                    newRows.push(combineRows(existingRow, null, nextTableName, nextTableData[0] || {}));
                 }
             });
-            if (!foundMatch && !!joinMatch[2]) { // LEFT JOIN logic
-                const joinedRow = {};
-                Object.keys(leftRow).forEach(k => joinedRow[`${leftName}.${k}`] = leftRow[k]);
-                rows.push({ ...leftRow, ...joinedRow });
-            }
-        });
+        } else {
+            // Nested Loop fallback for theta joins (>, <, etc)
+            rows.forEach(existingRow => {
+                let foundMatch = false;
+                nextTableData.forEach(m => {
+                    const lVal = existingRow[leftCol];
+                    const rVal = m[rightCol];
+                    let isMatch = false;
+                    if (operator === '>') isMatch = lVal > rVal;
+                    else if (operator === '<') isMatch = lVal < rVal;
+                    else if (operator === '>=') isMatch = lVal >= rVal;
+                    else if (operator === '<=') isMatch = lVal <= rVal;
+                    else if (operator === '!=') isMatch = lVal != rVal;
 
-    } else {
-        // Standard single-table load
-        const sourceData = resolvePath(parsed.fromClause, rootData);
-
-        // THROW ERROR IF SINGLE TABLE DOES NOT EXIST
-        if (!sourceData) throw new Error(`Table does not exist: ${parsed.fromClause}`);
-
-        rows = Array.isArray(sourceData) ? sourceData.map(r => ({ ...r })) : [];
-    }
+                    if (isMatch) {
+                        foundMatch = true;
+                        newRows.push(combineRows(existingRow, m, nextTableName));
+                    }
+                });
+                if (!foundMatch && joinDef.isLeft) {
+                    newRows.push(combineRows(existingRow, null, nextTableName, nextTableData[0] || {}));
+                }
+            });
+        }
+        rows = newRows; 
+    });
 
     // --- 2. WHERE FILTERING ---
-    rows = rows.filter(r => evaluateCondition(r, parsed.whereClause));
+    if (parsed.whereClause) {
+        rows = rows.filter(r => evaluateCondition(r, parsed.whereClause));
+    }
 
     // --- 3. WINDOW FUNCTIONS ---
     parsed.selectTokens.filter(t => t.isWindow).forEach(t => {
         const partitions = {};
         const partCols = t.partitionBy ? t.partitionBy.split(',').map(c => c.trim()) : [];
         rows.forEach(r => {
-            const key = partCols.map(col => String(r[col])).join('|');
+            const key = partCols.map(col => String(r[col] ?? "NULL")).join('|');
             if (!partitions[key]) partitions[key] = [];
             partitions[key].push(r);
         });
@@ -274,7 +380,7 @@ function executeQuery(sql, rootData) {
                         if (t.windowType === 'rank') {
                             r[t.alias] = isTie ? sorted[idx - 1][t.alias] : idx + 1;
                         } else {
-                            r[t.alias] = isTie ? sorted[idx - 1][t.alias] : sorted[idx - 1][t.alias] + 1;
+                            r[t.alias] = isTie ? sorted[idx - 1][t.alias] : (sorted[idx - 1][t.alias] + 1);
                         }
                     }
                 }
@@ -287,10 +393,8 @@ function executeQuery(sql, rootData) {
         const groups = {};
         const groupCols = parsed.groupBy.split(',').map(c => c.trim());
         rows.forEach(row => {
-            const key = groupCols.map(col => row[col]).join('|');
-            if (!groups[key]) {
-                groups[key] = { baseRow: { ...row }, aggValues: {} };
-            }
+            const key = groupCols.map(col => String(row[col] ?? "NULL")).join('|');
+            if (!groups[key]) groups[key] = { baseRow: { ...row }, aggValues: {} };
             parsed.selectTokens.filter(t => t.isAggregate).forEach(t => {
                 if (!groups[key].aggValues[t.alias]) groups[key].aggValues[t.alias] = [];
                 groups[key].aggValues[t.alias].push(t.aggColumn ? row[t.aggColumn] : 1);
@@ -308,46 +412,36 @@ function executeQuery(sql, rootData) {
     // --- 5. GLOBAL ORDER BY ---
     if (parsed.orderClause) rows = applyOrderBy(rows, parsed.orderClause);
 
-
-    // --- 6. FINAL PROJECTION ---
-    // Inside Step 6: FINAL PROJECTION
+    // --- 6. FINAL PROJECTION (Scalar Functions + Logic) ---
+    const finalAliases = parsed.selectTokens.map(t => t.alias);
     let result = rows.map(row => {
         const clean = {};
         parsed.selectTokens.forEach(t => {
-            // Check if the expression looks like a function: func(arg1, arg2)
             const funcMatch = t.expr.match(/^(\w+)\((.*)\)$/);
-
             if (funcMatch && !t.isAggregate && !t.isWindow) {
                 const funcName = funcMatch[1].toLowerCase();
                 const argsRaw = splitArgs(funcMatch[2]);
-
-                // Resolve arguments: either column value or a string literal
                 const resolvedArgs = argsRaw.map(arg => {
                     const isLiteral = /^['"].*['"]$/.test(arg);
                     if (isLiteral) return arg.replace(/['"]/g, '');
                     return row[arg] !== undefined ? row[arg] : null;
                 });
-
-                if (sqlFunctions[funcName]) {
-                    clean[t.alias] = sqlFunctions[funcName](resolvedArgs);
-                } else {
-                    clean[t.alias] = "NULL";
-                }
+                clean[t.alias] = sqlFunctions[funcName] ? sqlFunctions[funcName](resolvedArgs) : "NULL";
             } else {
-                // Standard column or already processed aggregate/window
-                clean[t.alias] = row[t.alias] !== undefined ? row[t.alias] : (row[t.expr] ?? "NULL");
+                const val = row[t.alias] !== undefined ? row[t.alias] : row[t.expr];
+                clean[t.alias] = (val !== undefined && val !== null) ? val : "NULL";
             }
         });
         return clean;
     });
 
-    // --- 6.5 DISTINCT (NEW) ---
+    // --- 6.5 DISTINCT ---
     if (parsed.isDistinct) {
         const seen = new Set();
         result = result.filter(row => {
-            const stringified = JSON.stringify(row);
-            if (seen.has(stringified)) return false;
-            seen.add(stringified);
+            const key = JSON.stringify(row);
+            if (seen.has(key)) return false;
+            seen.add(key);
             return true;
         });
     }
@@ -359,7 +453,6 @@ function executeQuery(sql, rootData) {
 
     return result;
 }
-
 // --- 4. ENGINE CORE ---
 function applyOrderBy(rows, orderClause) {
     if (!orderClause) return rows;
@@ -410,6 +503,22 @@ function evaluateCondition(row, condition) {
     });
 }
 
+// Helper to keep the code clean
+function combineRows(lRow, rRow, leftName, rightName, rightTemplate = {}) {
+    const combined = { ...lRow };
+    const namespaced = {};
+    Object.keys(lRow).forEach(k => namespaced[`${leftName}.${k}`] = lRow[k]);
+    
+    if (rRow) {
+        Object.assign(combined, rRow);
+        Object.keys(rRow).forEach(k => namespaced[`${rightName}.${k}`] = rRow[k]);
+    } else {
+        // Handle NULL side for LEFT JOIN
+        Object.keys(rightTemplate).forEach(k => namespaced[`${rightName}.${k}`] = "NULL");
+    }
+    return { ...combined, ...namespaced };
+}
+
 // Add to parseSQL or a helper
 function parseJoin(fromSegment) {
     const joinMatch = fromSegment.match(/(.+)[\s\S]+join[\s\S]+(.+)[\s\S]+on[\s\S]+(.+)/i);
@@ -443,27 +552,34 @@ function formatAsMySQLTable(rows) {
 
 // --- DATA ---
 
+
+
 const data = {
     friends: [
-        { name: "Chris", city: "New York" },
-        { name: "Lost Traveler", city: "Atlantis" } // Atlantis is not in cities!
+        { name: "Chris", city: "New York", countryCode: "USA" },
+        { name: "Emily", city: "Atlanta", countryCode: "USA" },
+        { name: "Yuki", city: "Tokyo", countryCode: "JPN" }
     ],
     cities: [
-        { cityName: "New York", state: "NY" }
+        { cityName: "New York", state: "NY" },
+        { cityName: "Atlanta", state: "GA" },
+        { cityName: "Tokyo", state: "TYO" }
+    ],
+    countries: [
+        { code: "USA", countryName: "United States" },
+        { code: "JPN", countryName: "Japan" }
     ]
 };
 
 
-
-
-
 try {
     // MULTI-LINE QUERY TEST
-    const leftJoinQuery = `SELECT 
-                                    friends.name, 
-                                    coalesce(cities.state, 'No State Found') as state_label
-                            FROM data.friend 
-                            LEFT JOIN data.cities ON city = cityName`;
+    const leftJoinQuery = `    SELECT friends.name, cities.cityName, countries.countryName
+FROM data.friends
+JOIN data.cities ON city = cityName
+JOIN data.countries ON countryCode = code`;
+
+
     console.log(formatAsMySQLTable(executeQuery(leftJoinQuery, data)));
 } catch (err) {
     console.error("SQL Error: " + err.message);

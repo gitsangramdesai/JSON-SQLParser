@@ -1,14 +1,29 @@
-// --- 1. REGISTRIES ---
+const readline = require('readline');
+
+// --- 1. REGISTRIES & HELPERS ---
 const sqlFunctions = {
     "upper": (args) => String(args[0] ?? "").toUpperCase(),
     "lower": (args) => String(args[0] ?? "").toLowerCase(),
-    "replace": (args) => {
-        const str = String(args[0] ?? ""), s = String(args[1] ?? ""), r = String(args[2] ?? "");
-        return str.split(s).join(r);
-    }
+    "sum": (values) => {
+        const valid = values.filter(v => v !== null && v !== "NULL" && v !== undefined);
+        return valid.reduce((a, b) => a + (Number(b) || 0), 0);
+    },
+    "count": (values) => values.filter(v => v !== null && v !== "NULL" && v !== undefined).length,
+    "avg": (values) => {
+        const valid = values.filter(v => v !== null && v !== "NULL" && v !== undefined);
+        return valid.length ? (valid.reduce((a, b) => a + (Number(b) || 0), 0) / valid.length) : 0;
+    },
+    "min": (values) => {
+        const valid = values.filter(v => v !== null && v !== "NULL" && v !== undefined).map(Number);
+        return valid.length ? Math.min(...valid) : "NULL";
+    },
+    "max": (values) => {
+        const valid = values.filter(v => v !== null && v !== "NULL" && v !== undefined).map(Number);
+        return valid.length ? Math.max(...valid) : "NULL";
+    },
+    "coalesce": (args) => args.find(v => v !== null && v !== "NULL" && v !== undefined && v !== "") ?? "NULL"
 };
 
-// --- 2. HELPERS ---
 function resolvePath(path, scope) {
     if (!path) return null;
     const parts = path.split('.');
@@ -21,180 +36,235 @@ function resolvePath(path, scope) {
     return current;
 }
 
-// --- 3. PARSER ---
+// --- 2. PAGER ---
+async function displayWithPager(allRows, pageSize = 5) {
+    if (!allRows || allRows.length === 0) {
+        console.log("Empty set.");
+        return;
+    }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    let currentIndex = 0;
+    while (currentIndex < allRows.length) {
+        console.clear();
+        const page = allRows.slice(currentIndex, currentIndex + pageSize);
+        const startRow = currentIndex + 1;
+        const endRow = Math.min(currentIndex + pageSize, allRows.length);
+        
+        console.log(`\n--- Showing rows ${startRow} to ${endRow} of ${allRows.length} ---`);
+        console.log(formatAsMySQLTable(page));
+
+        if (currentIndex + pageSize >= allRows.length) {
+            console.log("\n[END OF DATA] Press [Enter] to exit.");
+            await new Promise(res => rl.question('', res));
+            break;
+        }
+        const answer = await new Promise(res => rl.question('\nPress [Enter] for next page, or type ":q" to quit: ', res));
+        if (answer.toLowerCase().trim() === ':q') break;
+        currentIndex += pageSize;
+    }
+    rl.close();
+    console.clear();
+}
+
+// --- 3. PARSER ENGINE ---
 function parseAlias(token) {
     const parts = token.split(/\s+as\s+/i);
     return parts.length === 2 ? { expr: parts[0].trim(), alias: parts[1].trim() } : { expr: token, alias: token };
 }
 
-function getSelectTokensFromPart(expr) {
-    let result = [], depth = 0, buf = "";
-    for (let ch of expr) {
-        if (ch === "(") depth++; else if (ch === ")") depth--;
-        // Ensure we don't split commas inside parentheses (like window functions)
-        if (ch === "," && depth === 0) { result.push(parseAlias(buf.trim())); buf = ""; } else buf += ch;
-    }
-    if (buf) result.push(parseAlias(buf.trim()));
-    return result;
-}
-
-function findTopLevelClause(sqlLower, keyword) {
+function findTopLevelClause(sql, clause) {
     let depth = 0;
-    for (let i = 0; i < sqlLower.length; i++) {
-        if (sqlLower[i] === '(') depth++;
-        else if (sqlLower[i] === ')') depth--;
-
-        if (depth === 0 && sqlLower.startsWith(keyword, i)) {
-            return i;
+    const lowerSql = sql.toLowerCase();
+    const search = clause.toLowerCase();
+    for (let i = 0; i < sql.length; i++) {
+        if (sql[i] === '(') depth++;
+        if (sql[i] === ')') depth--;
+        if (depth === 0 && lowerSql.startsWith(search, i)) {
+            const before = i === 0 || /\s/.test(sql[i - 1]);
+            const after = /\s/.test(sql[i + search.length]) || i + search.length === sql.length;
+            if (before && after) return i;
         }
     }
     return -1;
 }
 
+function parseToken(raw) {
+    const aliasMatch = raw.match(/(.+) as (.+)/i);
+    const expr = aliasMatch ? aliasMatch[1].trim() : raw;
+    const alias = aliasMatch ? aliasMatch[2].trim() : expr.split('.').pop();
+    const isAggregate = /^(sum|avg|count|min|max)\(/i.test(expr);
+    const isWindow = /over\s*\(/i.test(expr);
+
+    let aggFunc = null, aggColumn = null;
+    if (isAggregate) {
+        const match = expr.match(/^(\w+)\((.*)\)/i);
+        aggFunc = match[1].toLowerCase();
+        aggColumn = match[2].trim() === "*" ? null : match[2].trim();
+    }
+    return { expr, alias, isAggregate, aggFunc, aggColumn, isWindow };
+}
+
 function parseSQL(sql) {
-    sql = sql.trim().replace(/;$/, '');
+    sql = sql.trim().replace(/\s+/g, ' ');
     const lower = sql.toLowerCase();
-    const findClause = (kw) => lower.indexOf(kw);
 
     const sIdx = findTopLevelClause(lower, "select");
     const fIdx = findTopLevelClause(lower, "from");
-    const gIdx = findTopLevelClause(lower, "group by");
-    const oIdx = findTopLevelClause(lower, "order by");
-    const wIdx = findClause("where");
-    
-    //const sIdx = findClause("select"), 
-    // fIdx = findClause("from"), 
-    // wIdx = findClause("where"), 
-    // gIdx = findClause("group by"), 
-    // oIdx = findClause("order by");
+    const wIdx = findTopLevelClause(lower, "where");
+    const lIdx = findTopLevelClause(lower, "limit");
 
     const getEnd = (start) => {
-        const b = [fIdx, wIdx, gIdx, oIdx].filter(i => i > start);
-        return b.length > 0 ? Math.min(...b) : sql.length;
+        const boundaries = [wIdx, lIdx].filter(i => i > start);
+        return boundaries.length > 0 ? Math.min(...boundaries) : sql.length;
     };
 
-    const selectPart = sql.slice(sIdx + 6, fIdx).trim();
-    const selectTokens = getSelectTokensFromPart(selectPart).map(token => {
-        // FIX: Use [\s\S] instead of . to match across multiple lines/newlines
-        const windowMatch = token.expr.match(/row_number\s*\(\s*\)\s+over\s*\(([\s\S]*)\)/i);
-        let internalOrder = null, partitionBy = null;
-        if (windowMatch) {
-            const content = windowMatch[1].trim();
-            const pMatch = content.match(/partition\s+by\s+([\s\S]*?)(?=order\s+by|$)/i);
-            if (pMatch) partitionBy = pMatch[1].trim();
-            const oMatch = content.match(/order\s+by\s+([\s\S]*)/i);
-            if (oMatch) internalOrder = oMatch[1].trim();
-        }
-        return { ...token, isWindow: !!windowMatch, windowOrder: internalOrder, partitionBy: partitionBy };
-    });
+    let selectPartRaw = sql.slice(sIdx + 6, fIdx).trim();
+    const selectTokens = [];
+    let depth = 0, current = "";
+    for (let i = 0; i < selectPartRaw.length; i++) {
+        if (selectPartRaw[i] === '(') depth++;
+        if (selectPartRaw[i] === ')') depth--;
+        if (selectPartRaw[i] === ',' && depth === 0) {
+            selectTokens.push(parseToken(current.trim()));
+            current = "";
+        } else current += selectPartRaw[i];
+    }
+    selectTokens.push(parseToken(current.trim()));
 
-    return {
-        selectTokens,
-        fromClause: sql.slice(fIdx + 4, getEnd(fIdx)).trim(),
-        groupBy: gIdx !== -1 ? sql.slice(gIdx + 8, getEnd(gIdx)).trim() : null,
-        orderClause: oIdx !== -1 ? sql.slice(oIdx + 9).trim() : null
-    };
-}
+    const fromSection = sql.slice(fIdx + 4, getEnd(fIdx)).trim();
+    const joinParts = fromSection.split(/\sjoin\s/i);
+    const baseTable = joinParts[0].trim();
+    const joins = [];
 
-// --- 4. ENGINE CORE ---
-function applyOrderBy(rows, orderClause) {
-    if (!orderClause) return rows;
-    const orders = orderClause.split(",").map(p => {
-        const t = p.trim().split(/\s+/);
-        return { expr: t[0].trim(), dir: (t[1] || "ASC").toUpperCase() };
-    });
-    return [...rows].sort((a, b) => {
-        for (const { expr, dir } of orders) {
-            let av = a[expr], bv = b[expr];
-            if (!isNaN(av) && !isNaN(bv)) { av = Number(av); bv = Number(bv); }
-            if (av < bv) return dir === "ASC" ? -1 : 1;
-            if (av > bv) return dir === "ASC" ? 1 : -1;
-        }
-        return 0;
-    });
-}
-
-function executeQuery(sql, rootData) {
-    const parsed = parseSQL(sql);
-    const sourceData = resolvePath(parsed.fromClause, rootData);
-    if (!Array.isArray(sourceData)) return [];
-
-    let rows = sourceData.map(r => ({ ...r }));
-
-    // 1. WINDOW FUNCTIONS (Calculating ranks on the raw dataset)
-    parsed.selectTokens.filter(t => t.isWindow).forEach(t => {
-        const partitions = {};
-        const partCols = t.partitionBy ? t.partitionBy.split(',').map(c => c.trim()) : [];
-
-        rows.forEach(r => {
-            const key = partCols.map(col => String(r[col])).join('|');
-            if (!partitions[key]) partitions[key] = [];
-            partitions[key].push(r);
-        });
-
-        Object.values(partitions).forEach(pRows => {
-            const sorted = applyOrderBy(pRows, t.windowOrder);
-            sorted.forEach((r, idx) => { r[t.alias] = idx + 1; });
-        });
-    });
-
-    // 2. GROUP BY (Collapsing rows while preserving window function aliases)
-    if (parsed.groupBy) {
-        const groups = {};
-        const groupCols = parsed.groupBy.split(',').map(c => c.trim());
-        rows.forEach(row => {
-            const key = groupCols.map(col => row[col]).join('|');
-            if (!groups[key]) groups[key] = { ...row };
-        });
-        rows = Object.values(groups);
+    for (let i = 1; i < joinParts.length; i++) {
+        const joinSegment = joinParts[i];
+        const onIdx = joinSegment.toLowerCase().indexOf(" on ");
+        const tablePath = joinSegment.slice(0, onIdx).trim();
+        const condition = joinSegment.slice(onIdx + 4).trim();
+        joins.push({ tablePath, condition });
     }
 
-    // 3. FINAL GLOBAL ORDER BY
-    if (parsed.orderClause) rows = applyOrderBy(rows, parsed.orderClause);
-
-    // 4. SELECT PROJECTION
-    const finalAliases = parsed.selectTokens.map(t => t.alias);
-    return rows.map(row => {
-        const clean = {};
-        finalAliases.forEach(a => { clean[a] = row[a] ?? ""; });
-        return clean;
-    });
+    return { selectTokens, baseTable, joins, whereClause: wIdx !== -1 ? sql.slice(wIdx + 6, getEnd(wIdx)).trim() : null };
 }
 
-// --- FORMATTER ---
+// --- 4. EXECUTION ENGINE ---
+async function executeQuery(sql, rootData) {
+    // 1. EXTRACT HINTS & CLEAN SQL
+    const hintMatch = sql.match(/with\s*\(([^)]+)\)\s*;?\s*$/i);
+    let activeHints = [];
+    let cleanSql = sql;
+
+    if (hintMatch) {
+        activeHints = hintMatch[1].split(',').map(h => h.trim().toLowerCase());
+        cleanSql = sql.replace(hintMatch[0], '').trim();
+    }
+
+    const parsed = parseSQL(cleanSql);
+
+    // 2. DATA LOADING & JOINS
+    let rows = [];
+    const baseData = resolvePath(parsed.baseTable, rootData);
+    if (!baseData) throw new Error(`Table not found: ${parsed.baseTable}`);
+
+    const baseName = parsed.baseTable.split('.').pop();
+    rows = baseData.map(r => {
+        const namespaced = {};
+        Object.keys(r).forEach(k => namespaced[`${baseName}.${k}`] = r[k]);
+        return { ...r, ...namespaced };
+    });
+
+    for (const joinDef of parsed.joins) {
+        const nextTableData = resolvePath(joinDef.tablePath, rootData);
+        const nextTableName = joinDef.tablePath.split('.').pop();
+        const [leftCol, rightCol] = joinDef.condition.split('=').map(c => c.trim());
+        const newRows = [];
+
+        rows.forEach(existingRow => {
+            const lookupValue = existingRow[leftCol] ?? existingRow[leftCol.split('.').pop()];
+            nextTableData.forEach(m => {
+                if (String(lookupValue) === String(m[rightCol])) {
+                    const namespacedMatch = {};
+                    Object.keys(m).forEach(k => namespacedMatch[`${nextTableName}.${k}`] = m[k]);
+                    newRows.push({ ...existingRow, ...m, ...namespacedMatch });
+                }
+            });
+        });
+        rows = newRows;
+    }
+
+    // 3. FINAL PROJECTION (Mapping rows to selected columns)
+    let result = rows.map(row => {
+        const clean = {};
+        parsed.selectTokens.forEach(t => {
+            const val = row[t.alias] !== undefined ? row[t.alias] : row[t.expr];
+            clean[t.alias] = (val !== undefined && val !== null) ? val : "NULL";
+        });
+        return clean;
+    });
+
+    // 4. APPLY HINTS
+    if (activeHints.includes('paginate')) {
+        await displayWithPager(result, 5);
+    }
+
+    if (activeHints.includes('headercolumnuppercase')) {
+        result = result.map(row => 
+            Object.fromEntries(Object.entries(row).map(([k, v]) => [k.toUpperCase(), v]))
+        );
+    }
+
+    if (activeHints.includes('outputjson')) {
+        result = JSON.stringify(result, null, 2);
+    }
+
+    return result;
+}
+
+// --- 5. FORMATTER ---
 function formatAsMySQLTable(rows) {
-    if (!rows.length) return "Empty set";
+    if (!rows || !rows.length) return "Empty set";
     const columns = Object.keys(rows[0]);
     const widths = {};
     columns.forEach(col => widths[col] = Math.max(col.length, ...rows.map(r => String(r[col] ?? "").length)));
     const line = () => "+" + columns.map(c => "-".repeat(widths[c] + 2)).join("+") + "+";
-    const rowStr = (vals) => "| " + vals.map((v, i) => String(v ?? "").padEnd(widths[columns[i]])).join(" | ") + " |";
+    const rowStr = (vals) => "| " + vals.map((v, i) => String(v).padEnd(widths[columns[i]])).join(" | ") + " |";
+
     let output = line() + "\n" + rowStr(columns) + "\n" + line() + "\n";
     rows.forEach(r => output += rowStr(columns.map(c => r[c])) + "\n");
     return output + line();
 }
 
-// --- DATA ---
-const data = {
+// --- 6. RUN TEST ---
+const db = {
     friends: [
-        { name: "Chris", age: 23, city: "New York", gender: "Male" },
-        { name: "Emily", age: 19, city: "Atlanta", gender: "Female" },
-        { name: "Joe", age: 32, city: "New York", gender: "Male" },
-        { name: "Kevin", age: 19, city: "Atlanta", gender: "Male" },
-        { name: "Michelle", age: 27, city: "Los Angeles", gender: "Female" },
-        { name: "Robert", age: 45, city: "Manhattan", gender: "Male" },
-        { name: "Sarah", age: 31, city: "New York", gender: "Female" }
-    ]
+        { name: "Chris", city: "New York", countryCode: "USA" },
+        { name: "Yuki", city: "Tokyo", countryCode: "JPN" },
+        { name: "Emily", city: "Atlanta", countryCode: "USA" },
+        { name: "Sato", city: "Tokyo", countryCode: "JPN" },
+        { name: "James", city: "New York", countryCode: "USA" },
+        { name: "Aiko", city: "Tokyo", countryCode: "JPN" },
+        { name: "Sarah", city: "Atlanta", countryCode: "USA" },
+        { name: "Kenji", city: "Tokyo", countryCode: "JPN" },
+        { name: "John", city: "New York", countryCode: "USA" },
+        { name: "Miku", city: "Tokyo", countryCode: "JPN" },
+        { name: "Robert", city: "Atlanta", countryCode: "USA" },
+        { name: "Hiro", city: "Tokyo", countryCode: "JPN" },
+        { name: "Alice", city: "New York", countryCode: "USA" },
+        { name: "Takumi", city: "Tokyo", countryCode: "JPN" },
+        { name: "Laura", city: "Atlanta", countryCode: "USA" }
+    ],
+    cities: [{ cityName: "New York" }, { cityName: "Atlanta" }, { cityName: "Tokyo" }],
+    countries: [{ code: "USA", countryName: "United States" }, { code: "JPN", countryName: "Japan" }]
 };
 
-// MULTI-LINE QUERY TEST
-const sqlQuery = `SELECT city, gender, name, age,
-       ROW_NUMBER() OVER (
-            PARTITION BY city, gender
-            ORDER BY name ASC
-        ) AS city_rank
-FROM data.friends
-GROUP BY city, gender, name, age
-ORDER BY  city, gender, city_rank`;
+const sql = `SELECT friends.name, cities.cityName, countries.countryName 
+             FROM friends 
+             JOIN cities ON city = cityName 
+             JOIN countries ON countryCode = code 
+             WITH(HeaderColumnUpperCase,PAGINATE);`;
 
-console.log(formatAsMySQLTable(executeQuery(sqlQuery, data)));
+executeQuery(sql, db)
+    .then(console.log)
+    .catch(err => console.error(err));
+
+    //OutputJSON,HeaderColumnUpperCase,Paginate
