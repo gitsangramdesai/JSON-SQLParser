@@ -195,19 +195,26 @@ async function executeQuery(sql, rootData) {
     // ... (Data Loading & Joins)
 
     // 2.5 APPLY WHERE CLAUSE
-    if (parsed.whereClause) {
-        // Simple parser for "column = 'value'"
-        const match = parsed.whereClause.match(/(.+?)\s*=\s*['"]?(.+?)['"]?$/i);
-        if (match) {
-            const [_, col, val] = match;
-            rows = rows.filter(row => {
-                // Check both namespaced and raw keys
-                const actualValue = row[col.trim()] ?? row[col.trim().split('.').pop()];
-                return String(actualValue) === String(val.trim());
-            });
-        }
-    }
+    // --- 2.5 APPLY WHERE CLAUSE (Improved) ---
+if (parsed.whereClause) {
+    // Split by 'and' (case insensitive)
+    const conditions = parsed.whereClause.split(/\s+and\s+/i);
+    
+    rows = rows.filter(row => {
+        return conditions.every(cond => {
+            const match = cond.match(/(.+?)\s*=\s*['"]?(.+?)['"]?$/i);
+            if (!match) return true;
+            
+            let [_, col, val] = match;
+            col = col.trim();
+            val = val.trim();
 
+            // Resolve value from row (handling namespaced vs raw keys)
+            const actualValue = row[col] ?? row[col.split('.').pop()];
+            return String(actualValue) === String(val);
+        });
+    });
+}
     // 3. FINAL PROJECTION ...
 
     // 3. FINAL PROJECTION (Mapping rows to selected columns)
@@ -278,7 +285,7 @@ const db = {
 const sql = `SELECT friends.name, cities.cityName, countries.countryName 
              FROM friends 
              JOIN cities ON city = cityName 
-             JOIN countries ON countryCode = code where  cities.cityName='Tokyo'
+             JOIN countries ON countryCode = code where  cities.cityName='Tokyo' and friends.name='Miku'
              WITH(HeaderColumnUpperCase,PAGINATE);`;
 
 executeQuery(sql, db)
