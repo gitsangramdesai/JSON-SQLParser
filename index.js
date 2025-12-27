@@ -187,18 +187,32 @@ async function executeQuery(sql, rootData) {
     }
 
     // 2.5 APPLY WHERE CLAUSE (Fix: Case-insensitive & Multi-condition)
+    // --- 2.5 APPLY WHERE CLAUSE (Handles AND & OR) ---
     if (parsed.whereClause) {
-        const conditions = parsed.whereClause.split(/\s+and\s+/i);
+        // Split by OR first (lowest precedence)
+        const orGroups = parsed.whereClause.split(/\s+or\s+/i);
+        
         rows = rows.filter(row => {
-            return conditions.every(cond => {
-                const match = cond.match(/(.+?)\s*=\s*['"]?(.+?)['"]?$/i);
-                if (!match) return true;
-                let [_, col, val] = match;
-                col = col.trim();
-                val = val.trim().replace(/['"]/g, ""); // Remove potential quotes
+            // If ANY group in the OR list is true, the row stays
+            return orGroups.some(group => {
+                // Within each group, check AND conditions
+                const andConditions = group.split(/\s+and\s+/i);
+                
+                return andConditions.every(cond => {
+                    const match = cond.match(/(.+?)\s*(=|!=|>|<)\s*['"]?(.+?)['"]?$/i);
+                    if (!match) return true;
+                    
+                    let [_, col, op, val] = match;
+                    col = col.trim();
+                    val = val.trim().replace(/['"]/g, "");
+                    const actualValue = String(row[col] ?? row[col.split('.').pop()] ?? "").toLowerCase();
+                    const targetValue = val.toLowerCase();
 
-                const actualValue = row[col] ?? row[col.split('.').pop()];
-                return String(actualValue).toLowerCase() === String(val).toLowerCase();
+                    // Basic operator logic
+                    if (op === '=') return actualValue === targetValue;
+                    if (op === '!=') return actualValue !== targetValue;
+                    return false;
+                });
             });
         });
     }
@@ -272,7 +286,7 @@ const sql = `SELECT friends.name, cities.cityName, countries.countryName
              FROM friends 
              JOIN cities ON city = cityName 
              JOIN countries ON countryCode = code 
-             WHERE cities.cityName='Tokyo' AND friends.name='Miku'
+             WHERE cities.cityName='Tokyo' OR friends.name='Sarah'
              WITH(HeaderColumnUpperCase, OutputJSON);`;
 
 executeQuery(sql, db)
