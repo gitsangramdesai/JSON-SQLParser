@@ -49,7 +49,7 @@ async function displayWithPager(allRows, pageSize = 5) {
         const page = allRows.slice(currentIndex, currentIndex + pageSize);
         const startRow = currentIndex + 1;
         const endRow = Math.min(currentIndex + pageSize, allRows.length);
-
+        
         console.log(`\n--- Showing rows ${startRow} to ${endRow} of ${allRows.length} ---`);
         console.log(formatAsMySQLTable(page));
 
@@ -192,24 +192,6 @@ async function executeQuery(sql, rootData) {
         rows = newRows;
     }
 
-    // ... (Data Loading & Joins)
-
-    // 2.5 APPLY WHERE CLAUSE
-    if (parsed.whereClause) {
-        // Simple parser for "column = 'value'"
-        const match = parsed.whereClause.match(/(.+?)\s*=\s*['"]?(.+?)['"]?$/i);
-        if (match) {
-            const [_, col, val] = match;
-            rows = rows.filter(row => {
-                // Check both namespaced and raw keys
-                const actualValue = row[col.trim()] ?? row[col.trim().split('.').pop()];
-                return String(actualValue) === String(val.trim());
-            });
-        }
-    }
-
-    // 3. FINAL PROJECTION ...
-
     // 3. FINAL PROJECTION (Mapping rows to selected columns)
     let result = rows.map(row => {
         const clean = {};
@@ -226,7 +208,7 @@ async function executeQuery(sql, rootData) {
     }
 
     if (activeHints.includes('headercolumnuppercase')) {
-        result = result.map(row =>
+        result = result.map(row => 
             Object.fromEntries(Object.entries(row).map(([k, v]) => [k.toUpperCase(), v]))
         );
     }
@@ -285,4 +267,4 @@ executeQuery(sql, db)
     .then(console.log)
     .catch(err => console.error(err));
 
-//OutputJSON,HeaderColumnUpperCase,Paginate
+    //OutputJSON,HeaderColumnUpperCase,Paginate

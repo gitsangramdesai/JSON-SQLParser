@@ -481,3 +481,11 @@ const data = {
     FROM data.employees
     JOIN data.levels ON salary > minSalary
     ORDER BY salary DESC`;
+
+
+
+const sql = `SELECT friends.name, cities.cityName, countries.countryName 
+             FROM friends 
+             JOIN cities ON city = cityName 
+             JOIN countries ON countryCode = code 
+             WITH(HeaderColumnUpperCase,PAGINATE);`;
