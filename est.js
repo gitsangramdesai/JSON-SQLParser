@@ -67,19 +67,9 @@ async function displayWithPager(allRows, pageSize = 5) {
 }
 
 // --- 3. PARSER ENGINE ---
-function parseToken(raw) {
-    const aliasMatch = raw.match(/(.+) as (.+)/i);
-    const expr = aliasMatch ? aliasMatch[1].trim() : raw;
-    const alias = aliasMatch ? aliasMatch[2].trim() : expr.split('.').pop();
-    const isAggregate = /^(sum|avg|count|min|max)\(/i.test(expr);
-    
-    let aggFunc = null, aggColumn = null;
-    if (isAggregate) {
-        const match = expr.match(/^(\w+)\((.*)\)/i);
-        aggFunc = match[1].toLowerCase();
-        aggColumn = match[2].trim() === "*" ? null : match[2].trim();
-    }
-    return { expr, alias, isAggregate, aggFunc, aggColumn };
+function parseAlias(token) {
+    const parts = token.split(/\s+as\s+/i);
+    return parts.length === 2 ? { expr: parts[0].trim(), alias: parts[1].trim() } : { expr: token, alias: token };
 }
 
 function findTopLevelClause(sql, clause) {
@@ -98,6 +88,22 @@ function findTopLevelClause(sql, clause) {
     return -1;
 }
 
+function parseToken(raw) {
+    const aliasMatch = raw.match(/(.+) as (.+)/i);
+    const expr = aliasMatch ? aliasMatch[1].trim() : raw;
+    const alias = aliasMatch ? aliasMatch[2].trim() : expr.split('.').pop();
+    const isAggregate = /^(sum|avg|count|min|max)\(/i.test(expr);
+    const isWindow = /over\s*\(/i.test(expr);
+
+    let aggFunc = null, aggColumn = null;
+    if (isAggregate) {
+        const match = expr.match(/^(\w+)\((.*)\)/i);
+        aggFunc = match[1].toLowerCase();
+        aggColumn = match[2].trim() === "*" ? null : match[2].trim();
+    }
+    return { expr, alias, isAggregate, aggFunc, aggColumn, isWindow };
+}
+
 function parseSQL(sql) {
     sql = sql.trim().replace(/\s+/g, ' ');
     const lower = sql.toLowerCase();
@@ -105,10 +111,10 @@ function parseSQL(sql) {
     const sIdx = findTopLevelClause(lower, "select");
     const fIdx = findTopLevelClause(lower, "from");
     const wIdx = findTopLevelClause(lower, "where");
-    const withIdx = findTopLevelClause(lower, "with");
+    const lIdx = findTopLevelClause(lower, "limit");
 
     const getEnd = (start) => {
-        const boundaries = [wIdx, withIdx].filter(i => i > start);
+        const boundaries = [wIdx, lIdx].filter(i => i > start);
         return boundaries.length > 0 ? Math.min(...boundaries) : sql.length;
     };
 
@@ -138,20 +144,20 @@ function parseSQL(sql) {
         joins.push({ tablePath, condition });
     }
 
-    return { 
-        selectTokens, 
-        baseTable, 
-        joins, 
-        whereClause: wIdx !== -1 ? sql.slice(wIdx + 6, getEnd(wIdx)).trim() : null 
-    };
+    return { selectTokens, baseTable, joins, whereClause: wIdx !== -1 ? sql.slice(wIdx + 6, getEnd(wIdx)).trim() : null };
 }
 
 // --- 4. EXECUTION ENGINE ---
 async function executeQuery(sql, rootData) {
-    // 1. EXTRACT HINTS
+    // 1. EXTRACT HINTS & CLEAN SQL
     const hintMatch = sql.match(/with\s*\(([^)]+)\)\s*;?\s*$/i);
-    let activeHints = hintMatch ? hintMatch[1].split(',').map(h => h.trim().toLowerCase()) : [];
-    let cleanSql = hintMatch ? sql.replace(hintMatch[0], '').trim() : sql;
+    let activeHints = [];
+    let cleanSql = sql;
+
+    if (hintMatch) {
+        activeHints = hintMatch[1].split(',').map(h => h.trim().toLowerCase());
+        cleanSql = sql.replace(hintMatch[0], '').trim();
+    }
 
     const parsed = parseSQL(cleanSql);
 
@@ -186,24 +192,32 @@ async function executeQuery(sql, rootData) {
         rows = newRows;
     }
 
-    // 2.5 APPLY WHERE CLAUSE (Fix: Case-insensitive & Multi-condition)
-    if (parsed.whereClause) {
-        const conditions = parsed.whereClause.split(/\s+and\s+/i);
-        rows = rows.filter(row => {
-            return conditions.every(cond => {
-                const match = cond.match(/(.+?)\s*=\s*['"]?(.+?)['"]?$/i);
-                if (!match) return true;
-                let [_, col, val] = match;
-                col = col.trim();
-                val = val.trim().replace(/['"]/g, ""); // Remove potential quotes
+    // ... (Data Loading & Joins)
 
-                const actualValue = row[col] ?? row[col.split('.').pop()];
-                return String(actualValue).toLowerCase() === String(val).toLowerCase();
-            });
+    // 2.5 APPLY WHERE CLAUSE
+    // --- 2.5 APPLY WHERE CLAUSE (Improved) ---
+if (parsed.whereClause) {
+    // Split by 'and' (case insensitive)
+    const conditions = parsed.whereClause.split(/\s+and\s+/i);
+    
+    rows = rows.filter(row => {
+        return conditions.every(cond => {
+            const match = cond.match(/(.+?)\s*=\s*['"]?(.+?)['"]?$/i);
+            if (!match) return true;
+            
+            let [_, col, val] = match;
+            col = col.trim();
+            val = val.trim();
+
+            // Resolve value from row (handling namespaced vs raw keys)
+            const actualValue = row[col] ?? row[col.split('.').pop()];
+            return String(actualValue) === String(val);
         });
-    }
+    });
+}
+    // 3. FINAL PROJECTION ...
 
-    // 3. FINAL PROJECTION
+    // 3. FINAL PROJECTION (Mapping rows to selected columns)
     let result = rows.map(row => {
         const clean = {};
         parsed.selectTokens.forEach(t => {
@@ -225,7 +239,7 @@ async function executeQuery(sql, rootData) {
     }
 
     if (activeHints.includes('outputjson')) {
-        return JSON.stringify(result, null, 2);
+        result = JSON.stringify(result, null, 2);
     }
 
     return result;
@@ -233,7 +247,7 @@ async function executeQuery(sql, rootData) {
 
 // --- 5. FORMATTER ---
 function formatAsMySQLTable(rows) {
-    if (!rows || !rows.length || typeof rows === 'string') return rows;
+    if (!rows || !rows.length) return "Empty set";
     const columns = Object.keys(rows[0]);
     const widths = {};
     columns.forEach(col => widths[col] = Math.max(col.length, ...rows.map(r => String(r[col] ?? "").length)));
@@ -271,10 +285,11 @@ const db = {
 const sql = `SELECT friends.name, cities.cityName, countries.countryName 
              FROM friends 
              JOIN cities ON city = cityName 
-             JOIN countries ON countryCode = code 
-             WHERE cities.cityName='Tokyo' AND friends.name='Miku'
-             WITH(HeaderColumnUpperCase, OutputJSON);`;
+             JOIN countries ON countryCode = code where  cities.cityName='Tokyo' and friends.name='Miku'
+             WITH(HeaderColumnUpperCase,PAGINATE);`;
 
 executeQuery(sql, db)
-    .then(res => console.log(typeof res === 'string' ? res : formatAsMySQLTable(res)))
+    .then(console.log)
     .catch(err => console.error(err));
+
+//OutputJSON,HeaderColumnUpperCase,Paginate
